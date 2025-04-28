@@ -1,0 +1,547 @@
+
+// Cloud mask function
+function cloudMask(image){
+  var qa = image.select('QA_PIXEL');
+  var dilated = 1 << 1;
+  var cirrus = 1 << 2;
+  var cloud = 1 << 3;
+  var shadow = 1 << 4;
+  var mask = qa.bitwiseAnd(dilated).eq(0)
+    .and(qa.bitwiseAnd(cirrus).eq(0))
+    .and(qa.bitwiseAnd(cloud).eq(0))
+    .and(qa.bitwiseAnd(shadow).eq(0));
+  return image.select(['SR_B.*'], ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])
+    .updateMask(mask)
+    .multiply(0.0000275)
+    .add(-0.2);
+}
+// Create an image composite
+var image = l8.filterBounds(roi).filterDate('2023-01-01', '2023-12-31')
+  .merge(l9.filterBounds(roi).filterDate('2023-01-01', '2023-12-31'))
+  .map(cloudMask)
+  .median()
+  .clip(roi);
+  Map.addLayer(image, { min: [0.1, 0.05, 0.05], max: [0.4, 0.3, 0.2], bands: ['B5', 'B6', 'B7']}, 'Image');
+
+// Band map
+var bandMap = {
+  BLUE: image.select('B2'),
+  GREEN: image.select('B3'),
+  RED: image.select('B4'),
+  NIR: image.select('B5'),
+  SWIR1: image.select('B6'),
+  SWIR2: image.select('B7')
+};
+// Add spectral indices
+var indices = ee.Image([
+  { name: 'EVI', formula: '(2.5 * (NIR - RED)) / (NIR + 6 * RED - 7.5 * BLUE + 1)' },
+  { name: 'NBR', formula: '(NIR - SWIR2) / (NIR + SWIR2)' },
+  { name: 'NDMI', formula: '(NIR - SWIR1) / (NIR + SWIR1)' },
+  { name: 'NDWI', formula: '(GREEN - NIR) / (GREEN + NIR)' },
+  { name: 'NDBI', formula: '(SWIR1 - NIR) / (SWIR1 + NIR)' },
+  { name: 'NDBaI', formula: '(SWIR1 - SWIR2) / (SWIR1 + SWIR2)' },
+].map(function(dict){
+  var indexImage = image.expression(dict.formula, bandMap).rename(dict.name);
+  return indexImage;
+}));
+
+// Add index & SRTM to image
+image = image.addBands(indices).addBands(srtm.clip(roi));
+
+// Variable info
+var classValue = [1, 2, 3, 4, 5, 6];
+var classNames = ['Built-up', 'Bareland', 'Water', 'parks', 'agriculture', 'mountains'];
+var classPalette = ['F08080', 'D2B48C', '87CEFA', '008080', '90EE90','FF0000'];
+var columns = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'EVI', 'NBR', 'NDMI', 'NDWI', 'NDBI', 'NDBaI', 'elevation', 'classvalue', 'sample'];
+var features = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'EVI', 'NBR', 'NDMI', 'NDWI', 'NDBI', 'NDBaI', 'elevation'];
+
+// Sampels
+var samples = built.merge(bareland).merge(water).merge(parks).merge(agriculture).merge(mountains)
+  .map(function(feat){ return feat.buffer(30) });
+  
+// Split samples to train and test per class
+samples = ee.FeatureCollection(classValue.map(function(value){
+  var features = samples.filter(ee.Filter.eq('classvalue', value)).randomColumn();
+  var train = features.filter(ee.Filter.lte('random', 0.8)).map(function(feat){ return feat.set('sample', 'train')});
+  var test = features.filter(ee.Filter.gt('random', 0.8)).map(function(feat){ return feat.set('sample', 'test')});
+  return train.merge(test);
+})).flatten(); 
+
+// Debugging: Print the size of samples before splitting
+print('Total samples size', samples.size());
+
+
+// Extract samples
+var extract = image.sampleRegions({
+  collection: samples,
+  scale: 30,
+  properties: ['sample', 'classvalue']
+});
+
+// Train samples
+var train = extract.filter(ee.Filter.eq('sample', 'train'));
+print('Train sample size', train.size());
+var test = extract.filter(ee.Filter.eq('sample', 'test'));
+print('Test sample size', test.size());
+
+// Export image and samples
+Export.image.toDrive({
+  image: image.toFloat(),
+  scale: 30,
+  maxPixels: 1e13,
+  region: roi,
+  crs: 'EPSG:4326',
+  folder: 'DL',
+  description: 'Landsat_Jambi_2023'
+});
+
+Export.table.toDrive({
+  collection: extract,
+  fileFormat: 'CSV',
+  selectors: columns,
+  description: 'Samples_LC_Jambi_2023',
+  folder: 'DL'
+});
+
+// Random forest model
+var model = ee.Classifier.smileRandomForest(300).train(train, 'classvalue', features);
+print(model.explain());
+
+// Test model
+var cm = test.classify(model, 'predicted').errorMatrix('classvalue', 'predicted');
+print('Confusion matrix', cm, 'Accuracy', cm.accuracy(), 'Kappa', cm.kappa());
+
+// Apply model
+var lc = image.classify(model, 'lulc').clip(roi)
+  .set('lulc_class_values', classValue, 'lulc_class_palette', classPalette);
+Map.addLayer(lc, {}, 'LULC');
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Define region of interest (roi) and SRTM (if not defined)
+
+
+// Filter Landsat 5 collection
+////////////////////////////////////////////////////////////////////////////////////////////////
+// Define region of interest (roi) and SRTM (if not defined)
+// Filter Landsat 5 collection
+var l5 = l53;
+var images = l5.filterBounds(roi)
+  .filterMetadata('CLOUD_COVER', 'less_than', 10)
+  .filterDate('2000-01-01', '2000-12-31')
+  .sort('CLOUD_COVER', true);
+
+print(images);
+
+// Calculate the median image
+var image = images.median().clip(roi);
+
+// Visualization parameters
+var visualization = {
+  bands: ['SR_B3', 'SR_B2', 'SR_B1'],
+  gamma: 1.40,
+};
+Map.centerObject(roi, 10);
+Map.addLayer(image, visualization, 'True Color (321)');
+
+// Band map for index calculation
+var bandMap = {
+  BLUE: image.select('SR_B1'),
+  GREEN: image.select('SR_B2'),
+  RED: image.select('SR_B3'),
+  NIR: image.select('SR_B4'),
+  SWIR1: image.select('SR_B5'),
+  SWIR2: image.select('SR_B7')
+};
+
+// Calculate indices
+var indices = ee.Image([
+  { name: 'EVI', formula: '(2.5 * (NIR - RED)) / (NIR + 6 * RED - 7.5 * BLUE + 1)' },
+  { name: 'NBR', formula: '(NIR - SWIR2) / (NIR + SWIR2)' },
+  { name: 'NDMI', formula: '(NIR - SWIR1) / (NIR + SWIR1)' },
+  { name: 'NDWI', formula: '(GREEN - NIR) / (GREEN + NIR)' },
+  { name: 'NDBI', formula: '(SWIR1 - NIR) / (SWIR1 + NIR)' },
+  { name: 'NDBaI', formula: '(SWIR1 - SWIR2) / (SWIR1 + SWIR2)' },
+].map(function(dict) {
+  var indexImage = image.expression(dict.formula, bandMap).rename(dict.name);
+  return indexImage;
+}));
+
+// Add indices and SRTM to image
+image = image.addBands(indices).addBands(srtm.clip(roi));
+
+// Define land cover classes with appropriate 'Class' property
+
+// Variable info
+var classValue = [1, 2, 3, 4, 5];
+var classNames = ['Built-up', 'Bareland', 'parks', 'agriculture', 'mountains'];
+var classPalette = ['F08080', 'D2B48C',  '008080', '90EE90','FF0000'];
+//var columns = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'EVI', 'NBR', 'NDMI', 'NDWI', 'NDBI', 'NDBaI', 'elevation', 'classvalue', 'sample'];
+//var features = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'EVI', 'NBR', 'NDMI', 'NDWI', 'NDBI', 'NDBaI', 'elevation'];
+// Merge training samples
+var training = built.merge(bareland).merge(parks).merge(agriculture).merge(mountains)
+  .map(function(feat) { return feat.buffer(30); });
+
+// Check class distribution
+var classDistribution = training.reduceColumns(ee.Reducer.frequencyHistogram(), ['classvalue']);
+print('Class distribution in training set:', classDistribution);
+
+// Split samples into training and testing sets
+var bands = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'EVI', 'NBR', 'NDMI', 'NDWI', 'NDBI', 'NDBaI', 'elevation'];
+var input = image.select(bands);
+var label = 'classvalue';
+
+var trainImage = input.sampleRegions({
+  collection: training,
+  properties: [label],
+  scale: 30
+});
+print('Sample from trainImage:', trainImage.first());
+
+var trainingData = trainImage.randomColumn();
+var trainSet = trainingData.filter(ee.Filter.lessThan('random', 0.8));
+var testSet = trainingData.filter(ee.Filter.greaterThanOrEquals('random', 0.8));
+
+// Train classifier with more trees
+var classifier = ee.Classifier.smileRandomForest(300).train({
+  features: trainSet,
+  classProperty: 'classvalue',
+  inputProperties: bands
+});
+
+// Evaluate classifier performance
+var cm = testSet.classify(classifier).errorMatrix('classvalue', 'classification');
+print('Confusion Matrix:', cm);
+print('Overall Accuracy:', cm.accuracy());
+
+// Classify the image
+var classified = image.classify(classifier);
+
+// Define visualization parameters for the classified image
+Map.addLayer(classified, {
+  min: 1,
+  max: 6,
+  palette: ['#F08080', '#D2B48C', '#008080', '#90EE90', '#FF0000']
+}, 'Classified Image');
+
+//////////////////////////////////////////////////////////////////////////////
+
+// 1. Calculate Class Distributions for LULC (2000) and Classified Image (2023)
+var lulcDistribution = ee.Dictionary(lc.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('lulc'));
+
+var classifiedDistribution = ee.Dictionary(classified.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('classification'));
+
+print('LULC Distribution:', lulcDistribution);
+print('Classified Image Distribution:', classifiedDistribution);
+
+// 2. Define the classes of interest to ensure both distributions are aligned
+var allClasses = ee.List([1, 2, 3, 4, 5, 6]);  // Adjust these based on your actual class values
+
+var lulcCounts = allClasses.map(function(c) {
+  return ee.Number(lulcDistribution.get(c, 0));  // Default to 0 if the class is missing
+});
+
+var classifiedCounts = allClasses.map(function(c) {
+  return ee.Number(classifiedDistribution.get(c, 0));  // Default to 0 if the class is missing
+});
+
+// 3. Create a Line Chart to Compare LULC and Classified Image Distributions
+var chart = ui.Chart.array.values({
+  array: ee.Array([lulcCounts, classifiedCounts]),
+  axis: 0
+})
+.setSeriesNames(['LULC (2000)', 'Classified Image (2023)'])
+.setChartType('LineChart')
+.setOptions({
+  title: 'Comparison of Land Cover Classes: LULC (2000) vs Classified Image (2023)',
+  hAxis: {title: 'Class', ticks: [{v: 1, f: 'Built-up'}, {v: 2, f: 'Bareland'}, {v: 3, f: 'Water'}, {v: 4, f: 'Parks'}, {v: 5, f: 'Agriculture'}, {v: 6, f: 'Mountains'}]},
+  vAxis: {title: 'Pixel Count'},
+  series: {
+    0: {lineWidth: 2, color: '#1f77b4'},  // LULC
+    1: {lineWidth: 2, color: '#ff7f0e'}   // Classified Image
+  },
+  legend: {position: 'bottom'}
+});
+
+print(chart);
+
+
+//////////////////////////////////////////////////////////////////
+
+// Calculate Built-up area for LULC (2000) and Classified Image (2023)
+var lulcBuiltUpArea = lc.eq(1).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('lulc');
+
+var classifiedBuiltUpArea = classified.eq(1).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('classification');
+
+print('Built-up Area in 2000 (sq. meters):', lulcBuiltUpArea);
+print('Built-up Area in 2023 (sq. meters):', classifiedBuiltUpArea);
+
+// Create a chart to compare the Built-up area in 2000 and 2023
+var builtUpChart = ui.Chart.array.values({
+  array: ee.Array([lulcBuiltUpArea, classifiedBuiltUpArea]),
+  axis: 0
+})
+.setChartType('ColumnChart')
+.setSeriesNames(['Built-up Area'])
+.setOptions({
+  title: 'Built-up Area Comparison: 2000 vs 2023',
+  hAxis: {title: 'Year', ticks: [{v: 0, f: '2000'}, {v: 1, f: '2023'}]},
+  vAxis: {title: 'Area (sq. meters)'},
+  legend: {position: 'none'},
+  colors: ['#FF0000']
+});
+
+print(builtUpChart);
+//////////////////////////////////////////////////////////////////////
+
+// Calculate Agricultural area for LULC (2000) and Classified Image (2023)
+var lulcAgricultureArea = lc.eq(5).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('lulc');
+
+var classifiedAgricultureArea = classified.eq(5).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('classification');
+
+print('Agricultural Area in 2000 (sq. meters):', lulcAgricultureArea);
+print('Agricultural Area in 2023 (sq. meters):', classifiedAgricultureArea);
+
+// Create a chart to compare the Agricultural area in 2000 and 2023
+var agricultureChart = ui.Chart.array.values({
+  array: ee.Array([lulcAgricultureArea, classifiedAgricultureArea]),
+  axis: 0
+})
+.setChartType('ColumnChart')
+.setSeriesNames(['Agricultural Area'])
+.setOptions({
+  title: 'Agricultural Area Comparison: 2000 vs 2023',
+  hAxis: {title: 'Year', ticks: [{v: 0, f: '2000'}, {v: 1, f: '2023'}]},
+  vAxis: {title: 'Area (sq. meters)'},
+  legend: {position: 'none'},
+  colors: ['#90EE90']
+});
+
+print(agricultureChart);
+////////////////////////////////////////////////
+// Calculate Bareland area for LULC (2000) and Classified Image (2023)
+var lulcBarelandArea = lc.eq(2).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('lulc');
+
+var classifiedBarelandArea = classified.eq(2).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('classification');
+
+print('Bareland Area in 2000 (sq. meters):', lulcBarelandArea);
+print('Bareland Area in 2023 (sq. meters):', classifiedBarelandArea);
+
+// Create a chart to compare the Bareland area in 2000 and 2023
+var barelandChart = ui.Chart.array.values({
+  array: ee.Array([lulcBarelandArea, classifiedBarelandArea]),
+  axis: 0
+})
+.setChartType('ColumnChart')
+.setSeriesNames(['Bareland Area'])
+.setOptions({
+  title: 'Bareland Area Comparison: 2000 vs 2023',
+  hAxis: {title: 'Year', ticks: [{v: 0, f: '2000'}, {v: 1, f: '2023'}]},
+  vAxis: {title: 'Area (sq. meters)'},
+  legend: {position: 'none'},
+  colors: ['#D2B48C']
+});
+
+print(barelandChart);
+/////////////////////////////////////////////////////////
+
+// Calculate Park area for LULC (2000) and Classified Image (2023)
+var lulcParkArea = lc.eq(4).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('lulc');
+
+var classifiedParkArea = classified.eq(4).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('classification');
+
+print('Park Area in 2000 (sq. meters):', lulcParkArea);
+print('Park Area in 2023 (sq. meters):', classifiedParkArea);
+
+// Create a chart to compare the Park area in 2000 and 2023
+var parkAreaChart = ui.Chart.array.values({
+  array: ee.Array([lulcParkArea, classifiedParkArea]),
+  axis: 0
+})
+.setChartType('ColumnChart')
+.setSeriesNames(['Park Area'])
+.setOptions({
+  title: 'Park Area Comparison: 2000 vs 2023',
+  hAxis: {title: 'Year', ticks: [{v: 0, f: '2000'}, {v: 1, f: '2023'}]},
+  vAxis: {title: 'Area (sq. meters)'},
+  legend: {position: 'none'},
+  colors: ['#008080']  // Teal color representing parks
+});
+
+print(parkAreaChart);
+
+// Calculate Water area for LULC (2000)
+var lulcWaterArea = lc.eq(3).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('lulc');
+
+// Calculate Water area for Classified Image (2023)
+var classifiedWaterArea = classified.eq(3).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('classification');
+
+print('Water Area in 2000 (sq. meters):', lulcWaterArea);
+print('Water Area in 2023 (sq. meters):', classifiedWaterArea);
+
+// Create a chart to compare the Water area in 2000 and 2023
+var waterChart = ui.Chart.array.values({
+  array: ee.Array([lulcWaterArea, classifiedWaterArea]),
+  axis: 0
+})
+.setChartType('ColumnChart')
+.setSeriesNames(['Water Area'])
+.setOptions({
+  title: 'Water Area Comparison: 2000 vs 2023',
+  hAxis: {title: 'Year', ticks: [{v: 0, f: '2000'}, {v: 1, f: '2023'}]},
+  vAxis: {title: 'Area (sq. meters)'},
+  legend: {position: 'none'},
+  colors: ['#87CEFA']  // Light blue color representing water
+});
+
+print(waterChart);
+
+
+// Calculate Mountain area for LULC (2000)
+var lulcMountainArea = lc.eq(6).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('lulc');
+
+// Calculate Mountain area for Classified Image (2023)
+var classifiedMountainArea = classified.eq(6).multiply(ee.Image.pixelArea()).reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi,
+  scale: 30,
+  bestEffort: true
+}).get('classification');
+
+print('Mountain Area in 2000 (sq. meters):', lulcMountainArea);
+print('Mountain Area in 2023 (sq. meters):', classifiedMountainArea);
+
+// Create a chart to compare the Mountain area in 2000 and 2023
+var mountainChart = ui.Chart.array.values({
+  array: ee.Array([lulcMountainArea, classifiedMountainArea]),
+  axis: 0
+})
+.setChartType('ColumnChart')
+.setSeriesNames(['Mountain Area'])
+.setOptions({
+  title: 'Mountain Area Comparison: 2000 vs 2023',
+  hAxis: {title: 'Year', ticks: [{v: 0, f: '2000'}, {v: 1, f: '2023'}]},
+  vAxis: {title: 'Area (sq. meters)'},
+  legend: {position: 'none'},
+  colors: ['#FF0000']  // Red color representing mountains
+});
+
+print(mountainChart);
+
+
+////////////////////////////////////////////////////////////////////////
+// Export the classified image for 2000
+Export.image.toDrive({
+  image: lc.toInt32(),  // Convert to integer for GeoTIFF export
+  description: 'LULC_2000',
+  folder: 'GeoTIFF',
+  region: roi,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// Export the classified image for 2023
+Export.image.toDrive({
+  image: classified.toInt32(),  // Convert to integer for GeoTIFF export
+  description: 'LULC_2023',
+  folder: 'GeoTIFF',
+  region: roi,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+/////////////////////////////////////////
+var bands = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'EVI', 'NBR', 'NDMI', 'NDWI', 'NDBI', 'NDBaI'];
+var label = 'classvalue';
+
+var trainImage = image.select(bands).sampleRegions({
+  collection: training,
+  properties: [label],
+  scale: 30
+});
+
+// Export the training samples
+Export.table.toDrive({
+  collection: trainImage,
+  fileFormat: 'CSV',
+  selectors: bands.concat([label]),
+  description: 'Landsat5_Training_Samples_2000',
+  folder: 'DL'
+});
+// Export the sample image
+Export.image.toDrive({
+  image: image.select(bands),
+  description: 'Landsat5_Sample_Image_2000',
+  region: roi,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  folder: 'DL'
+});
+print('Sample extraction complete');
