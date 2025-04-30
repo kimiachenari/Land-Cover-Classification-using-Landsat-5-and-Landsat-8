@@ -1,4 +1,4 @@
-![landuse 2016](https://github.com/user-attachments/assets/2cdefdd3-bc2c-4a6b-9e28-b8b81db455ea)# 🌍 **Land Cover Classification and Change Detection using Landsat 5 and Landsat 8** 🌍
+# 🌍 **Land Cover Classification and Change Detection using Landsat 5 and Landsat 8** 🌍
 
 This project uses **Landsat 5** (2000) and **Landsat 8** (2023) imagery to perform **land cover classification** and **change detection** over time. The goal is to compare and analyze changes in land cover between two different time periods, identifying different classes such as **Built-up**, **Bareland**, **Water**, **Parks**, **Agriculture**, and **Mountains**.
 
